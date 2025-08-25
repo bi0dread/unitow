@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -43,10 +44,58 @@ type Database interface {
 	Begin() Database
 }
 
+// Logger provides minimal leveled logging.
+type Logger interface {
+	Debug(msg string, fields ...any)
+	Info(msg string, fields ...any)
+	Warn(msg string, fields ...any)
+	Error(msg string, fields ...any)
+}
+
+type noopLogger struct{}
+
+func (l noopLogger) Debug(string, ...any) {}
+func (l noopLogger) Info(string, ...any)  {}
+func (l noopLogger) Warn(string, ...any)  {}
+func (l noopLogger) Error(string, ...any) {}
+
+// Metrics captures basic counters for observability.
+type Metrics interface {
+	IncBegin()
+	IncCommit()
+	IncRollback()
+}
+
+type noopMetrics struct{}
+
+func (m noopMetrics) IncBegin()    {}
+func (m noopMetrics) IncCommit()   {}
+func (m noopMetrics) IncRollback() {}
+
+// Hooks are optional callbacks around lifecycle.
+type Hooks struct {
+	BeforeCommit  func(name string)
+	AfterCommit   func(name string)
+	AfterRollback func(name string)
+}
+
+// TransactionOptions controls behavior of a transaction instance.
+type TransactionOptions struct {
+	Context       context.Context
+	Timeout       time.Duration
+	ReadOnly      bool
+	RetryAttempts int
+	RetryBackoff  time.Duration
+}
+
 type unitow struct {
 	db           Database
 	transactions *sync.Map
 	signalChan   chan string
+	logger       Logger
+	hooks        Hooks
+	metrics      Metrics
+	defaultOpts  TransactionOptions
 }
 
 func New(db Database) Unitow {
@@ -54,12 +103,35 @@ func New(db Database) Unitow {
 		db:           db,
 		transactions: &sync.Map{},
 		signalChan:   make(chan string),
+		logger:       noopLogger{},
+		metrics:      noopMetrics{},
 	}
 
 	go uni.listenToSignal()
 
 	return uni
 
+}
+
+// NewWith allows providing logger, hooks and metrics. Nil values are replaced with no-ops.
+func NewWith(db Database, logger Logger, hooks Hooks, metrics Metrics, defaultOpts TransactionOptions) Unitow {
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	if metrics == nil {
+		metrics = noopMetrics{}
+	}
+	uni := &unitow{
+		db:           db,
+		transactions: &sync.Map{},
+		signalChan:   make(chan string),
+		logger:       logger,
+		hooks:        hooks,
+		metrics:      metrics,
+		defaultOpts:  defaultOpts,
+	}
+	go uni.listenToSignal()
+	return uni
 }
 
 func (u *unitow) listenToSignal() {
@@ -76,13 +148,20 @@ type transaction struct {
 	signalChan     chan string
 	name           string
 	criticalStatus string
+	logger         Logger
+	hooks          Hooks
+	metrics        Metrics
+	options        TransactionOptions
+	committed      atomic.Bool
+	rolledBack     atomic.Bool
+	cancelTimer    func()
 }
 
 func (u *unitow) NewTransaction(name string) Transaction {
 
 	value, found := u.transactions.Load(name)
 	if found {
-		fmt.Printf("we found a transaction with name: %s , we return it!!!\n", name)
+		u.logger.Debug("reusing transaction", "name", name)
 		return value.(Transaction)
 	}
 
@@ -90,6 +169,10 @@ func (u *unitow) NewTransaction(name string) Transaction {
 		db:         u.db,
 		signalChan: u.signalChan,
 		name:       name,
+		logger:     u.logger,
+		hooks:      u.hooks,
+		metrics:    u.metrics,
+		options:    u.defaultOpts,
 	}
 
 	u.transactions.Store(name, trx)
@@ -99,10 +182,50 @@ func (u *unitow) NewTransaction(name string) Transaction {
 
 }
 
+// NewTransactionWithOptions creates a transaction with explicit options.
+func (u *unitow) NewTransactionWithOptions(name string, opts TransactionOptions) Transaction {
+	value, found := u.transactions.Load(name)
+	if found {
+		u.logger.Debug("reusing transaction", "name", name)
+		return value.(Transaction)
+	}
+	trx := &transaction{
+		db:         u.db,
+		signalChan: u.signalChan,
+		name:       name,
+		logger:     u.logger,
+		hooks:      u.hooks,
+		metrics:    u.metrics,
+		options:    opts,
+	}
+	u.transactions.Store(name, trx)
+	return trx
+}
+
 func (u *transaction) Start() {
 	if !u.active.Load() {
 		u.tx = u.db.Begin()
 		u.active.Store(true)
+		u.metrics.IncBegin()
+		// setup timeout/cancellation watcher if configured
+		ctx := u.options.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if u.options.Timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, u.options.Timeout)
+			u.cancelTimer = cancel
+		}
+		// watcher goroutine
+		go func(name string, done <-chan struct{}) {
+			select {
+			case <-done:
+				u.logger.Warn("transaction context cancelled or timed out", "name", name)
+				u.SetCriticalStatus(CONTEXT_FORCE_ROLLBACK)
+			default:
+			}
+		}(u.name, ctx.Done())
 	}
 	u.count.Add(1)
 }
@@ -110,8 +233,12 @@ func (u *transaction) Start() {
 func (u *transaction) Commit() (bool, error) {
 
 	if u.criticalStatus == CONTEXT_FORCE_ROLLBACK {
-		fmt.Println("transaction force to rollback , we can't commit it!!!")
+		u.logger.Warn("transaction forced to rollback; cannot commit", "name", u.name)
 		u.tx.Rollback()
+		u.metrics.IncRollback()
+		if u.hooks.AfterRollback != nil {
+			u.hooks.AfterRollback(u.name)
+		}
 		return true, nil
 	}
 
@@ -123,13 +250,51 @@ func (u *transaction) Commit() (bool, error) {
 				u.signalChan <- u.name
 			}()
 
-			err := u.tx.Commit()
+			if u.rolledBack.Load() {
+				return true, nil
+			}
+			if u.committed.Load() {
+				return true, nil
+			}
+
+			if u.hooks.BeforeCommit != nil {
+				u.hooks.BeforeCommit(u.name)
+			}
+
+			attempts := u.options.RetryAttempts
+			if attempts <= 0 {
+				attempts = 1
+			}
+			backoff := u.options.RetryBackoff
+			var err error
+			for i := 0; i < attempts; i++ {
+				err = u.tx.Commit()
+				if err == nil {
+					break
+				}
+				if i < attempts-1 && backoff > 0 {
+					time.Sleep(backoff)
+				}
+			}
 			u.active.Store(false)
 			u.count.Store(0)
+			if u.cancelTimer != nil {
+				u.cancelTimer()
+			}
 
-			return err == nil, err
+			if err != nil {
+				u.logger.Error("commit failed", "name", u.name, "error", err)
+				return false, err
+			}
+
+			u.committed.Store(true)
+			u.metrics.IncCommit()
+			if u.hooks.AfterCommit != nil {
+				u.hooks.AfterCommit(u.name)
+			}
+			return true, nil
 		} else {
-			fmt.Printf("we have %d open transactions yet\n", u.count.Load())
+			u.logger.Debug("open nested transactions remain", "open", u.count.Load())
 			return false, nil
 
 		}
@@ -140,15 +305,19 @@ func (u *transaction) Commit() (bool, error) {
 func (u *transaction) SetCriticalStatus(status string) {
 	if len(status) != 0 {
 
-		fmt.Println("transaction CriticalStatus set to " + status)
+		u.logger.Info("transaction critical status set", "name", u.name, "status", status)
 	}
 	u.criticalStatus = status
 }
 
 func (u *transaction) CommitAll() error {
 	if u.criticalStatus == CONTEXT_FORCE_ROLLBACK {
-		fmt.Println("transaction force to rollback , we can't commit it")
+		u.logger.Warn("transaction forced to rollback; cannot commit", "name", u.name)
 		u.tx.Rollback()
+		u.metrics.IncRollback()
+		if u.hooks.AfterRollback != nil {
+			u.hooks.AfterRollback(u.name)
+		}
 		return nil
 	}
 	for {
@@ -171,6 +340,14 @@ func (u *transaction) Rollback() {
 		u.tx.Rollback()
 		u.active.Store(false)
 		u.count.Store(0)
+		u.rolledBack.Store(true)
+		if u.cancelTimer != nil {
+			u.cancelTimer()
+		}
+		u.metrics.IncRollback()
+		if u.hooks.AfterRollback != nil {
+			u.hooks.AfterRollback(u.name)
+		}
 	}
 }
 
