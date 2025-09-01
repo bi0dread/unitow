@@ -1,4 +1,4 @@
-module unitow
+module github.com/bi0dread/unitow
 
 go 1.21
 
